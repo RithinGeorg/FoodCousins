@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - terraform-dev
+      - dev-deploy
+  pull_request:
+    branches:
+      - main
+      - develop
+      - terraform-dev
+      - dev-deploy
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Build, test and validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.400
+
+      - name: Restore .NET
+        run: dotnet restore FoodCousins.sln
+
+      - name: Build .NET
+        run: dotnet build FoodCousins.sln -c Release --no-restore
+
+      - name: Test .NET
+        run: dotnet test FoodCousins.sln -c Release --no-build
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install frontend dependencies
+        working-directory: frontend/foodcousins-web
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build React
+        working-directory: frontend/foodcousins-web
+        env:
+          VITE_API_BASE_URL: https://example.invalid
+        run: npm run build
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      - name: Terraform validate
+        working-directory: infra/environments/dev
+        run: |
+          terraform init -backend=false
+          terraform validate

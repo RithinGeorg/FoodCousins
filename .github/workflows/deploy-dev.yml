@@ -1,0 +1,173 @@
+name: Deploy Dev
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: foodcousins-deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy Dev application
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce dev-deploy source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "dev-deploy" ]; then
+            echo "Deploy Dev must be manually run from branch 'dev-deploy'."
+            echo "Selected branch: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Verify GitHub OIDC subject before Azure login
+        shell: bash
+        env:
+          EXPECTED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
+        run: |
+          set -euo pipefail
+          [ -n "${EXPECTED_SUBJECT}" ] || { echo "AZURE_FEDERATED_SUBJECT is missing."; exit 1; }
+          RESPONSE=$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange")
+          TOKEN=$(python -c 'import json,sys; print(json.load(sys.stdin)["value"])' <<< "$RESPONSE")
+          TOKEN="$TOKEN" EXPECTED_SUBJECT="$EXPECTED_SUBJECT" python - <<'PY'
+          import base64, json, os, sys
+          token = os.environ['TOKEN']
+          payload = token.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          subject = claims.get('sub', '')
+          print('OIDC subject:', subject)
+          if subject != os.environ['EXPECTED_SUBJECT']:
+              print('OIDC subject mismatch.', file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Azure login with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Find existing Dev Azure resources
+        id: azure
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESOURCE_GROUP="rg-foodcousins-dev"
+          API_APP=$(az webapp list --resource-group "$RESOURCE_GROUP" --query "[?starts_with(name, 'app-fc-api-dev-')].name | [0]" -o tsv)
+          FUNCTION_APP=$(az functionapp list --resource-group "$RESOURCE_GROUP" --query "[?starts_with(name, 'func-fc-dev-')].name | [0]" -o tsv)
+          SWA_APP=$(az staticwebapp list --resource-group "$RESOURCE_GROUP" --query "[?starts_with(name, 'swa-foodcousins-dev-')].name | [0]" -o tsv)
+          [ -n "$API_APP" ] || { echo "Dev API not found. Run Terraform Dev apply first."; exit 1; }
+          [ -n "$FUNCTION_APP" ] || { echo "Dev Function App not found. Run Terraform Dev apply first."; exit 1; }
+          [ -n "$SWA_APP" ] || { echo "Dev Static Web App not found. Run Terraform Dev apply first."; exit 1; }
+          API_HOST=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$API_APP" --query defaultHostName -o tsv)
+          SWA_HOST=$(az staticwebapp show --resource-group "$RESOURCE_GROUP" --name "$SWA_APP" --query defaultHostname -o tsv)
+          echo "resource_group=$RESOURCE_GROUP" >> "$GITHUB_OUTPUT"
+          echo "api_app=$API_APP" >> "$GITHUB_OUTPUT"
+          echo "function_app=$FUNCTION_APP" >> "$GITHUB_OUTPUT"
+          echo "swa_app=$SWA_APP" >> "$GITHUB_OUTPUT"
+          echo "api_url=https://$API_HOST" >> "$GITHUB_OUTPUT"
+          echo "swa_url=https://$SWA_HOST" >> "$GITHUB_OUTPUT"
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.400
+
+      - name: Restore .NET
+        run: dotnet restore FoodCousins.sln
+
+      - name: Build .NET
+        run: dotnet build FoodCousins.sln -c Release --no-restore
+
+      - name: Test .NET
+        run: dotnet test FoodCousins.sln -c Release --no-build
+
+      - name: Publish API
+        run: dotnet publish src/FoodCousins.Api/FoodCousins.Api.csproj -c Release --no-restore -o ./artifacts/api
+
+      - name: Publish Functions
+        run: dotnet publish src/FoodCousins.Functions/FoodCousins.Functions.csproj -c Release --no-restore -o ./artifacts/functions
+
+      - name: Deploy API
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.azure.outputs.api_app }}
+          package: ./artifacts/api
+
+      - name: Smoke test API
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..24}; do
+            if curl --fail --silent --show-error "${{ steps.azure.outputs.api_url }}/health"; then exit 0; fi
+            echo "API not healthy yet; retry $i/24"
+            sleep 10
+          done
+          exit 1
+
+      - name: Deploy Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ steps.azure.outputs.function_app }}
+          package: ./artifacts/functions
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install frontend dependencies
+        working-directory: frontend/foodcousins-web
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+
+      - name: Build React for Dev API
+        working-directory: frontend/foodcousins-web
+        env:
+          VITE_API_BASE_URL: ${{ steps.azure.outputs.api_url }}
+        run: npm run build
+
+      - name: Get Static Web App deployment token
+        id: swa
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN=$(az staticwebapp secrets list --name "${{ steps.azure.outputs.swa_app }}" --resource-group "${{ steps.azure.outputs.resource_group }}" --query properties.apiKey -o tsv)
+          [ -n "$TOKEN" ] || { echo "Static Web App deployment token not found."; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy React to Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa.outputs.token }}
+          action: upload
+          app_location: frontend/foodcousins-web/dist
+          skip_app_build: true
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          echo "### FoodCousins Dev deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source branch: ${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Frontend: ${{ steps.azure.outputs.swa_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API: ${{ steps.azure.outputs.api_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API health: ${{ steps.azure.outputs.api_url }}/health" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Azure Functions memory: 2048 MB" >> "$GITHUB_STEP_SUMMARY"

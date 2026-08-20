@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "ServiceBusConnection": "<local-service-bus-connection-string>"
+  },
+  "ConnectionStrings": {
+    "FoodCousins": "Server=localhost;Database=FoodCousinsDev;Trusted_Connection=True;TrustServerCertificate=True"
+  }
+}

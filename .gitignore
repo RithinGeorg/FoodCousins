@@ -1,0 +1,36 @@
+**/bin/
+**/obj/
+.vs/
+.vscode/
+.idea/
+node_modules/
+**/dist/
+*.user
+*.suo
+*.db
+*.sqlite
+*.log
+.env
+.env.*
+!.env.example
+infra/environments/dev/.terraform/
+infra/environments/dev/*.tfstate
+infra/environments/dev/*.tfstate.*
+infra/environments/dev/*.tfplan
+bootstrap-secrets.txt
+**/local.settings.json
+infra/environments/dev/*.tfvars
+!infra/environments/dev/terraform.tfvars.example
+infra/environments/dev/backend.hcl
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Terraform working directories / lock-safe state artifacts
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Bootstrap temporary files
+github-federated-credential*.json

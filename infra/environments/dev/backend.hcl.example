@@ -1,0 +1,5 @@
+resource_group_name  = "rg-foodcousins-tfstate"
+storage_account_name = "stfoodcousinstf123456"
+container_name       = "tfstate"
+key                  = "dev.terraform.tfstate"
+use_oidc             = true

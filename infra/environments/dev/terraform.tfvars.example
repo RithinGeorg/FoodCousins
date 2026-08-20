@@ -1,0 +1,8 @@
+sql_admin_login            = "foodcousinsadmin"
+alert_email                = "you@example.com"
+monthly_budget             = 75
+budget_start_date          = "2026-08-01T00:00:00Z"
+additional_frontend_origin = ""
+
+# Do NOT commit sql_admin_password here.
+# GitHub Actions passes it as a TF_VAR_* environment variable.

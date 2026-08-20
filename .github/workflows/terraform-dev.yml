@@ -1,0 +1,204 @@
+name: Terraform Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: true
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+concurrency:
+  group: foodcousins-terraform-dev
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce terraform-dev source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "terraform-dev" ]; then
+            echo "Terraform Dev must be manually run from branch 'terraform-dev'."
+            echo "Selected branch: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Validate GitHub Dev configuration
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_FEDERATED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
+          TFSTATE_RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+          TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+          TFSTATE_KEY: ${{ vars.TFSTATE_KEY }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          set -euo pipefail
+          require_value() { [ -n "$2" ] || { echo "$1 is missing from GitHub environment dev."; exit 1; }; }
+          require_value AZURE_CLIENT_ID "$AZURE_CLIENT_ID"
+          require_value AZURE_TENANT_ID "$AZURE_TENANT_ID"
+          require_value AZURE_SUBSCRIPTION_ID "$AZURE_SUBSCRIPTION_ID"
+          require_value AZURE_FEDERATED_SUBJECT "$AZURE_FEDERATED_SUBJECT"
+          require_value TFSTATE_RESOURCE_GROUP "$TFSTATE_RESOURCE_GROUP"
+          require_value TFSTATE_STORAGE_ACCOUNT "$TFSTATE_STORAGE_ACCOUNT"
+          require_value TFSTATE_CONTAINER "$TFSTATE_CONTAINER"
+          require_value TFSTATE_KEY "$TFSTATE_KEY"
+          require_value SQL_ADMIN_PASSWORD "$SQL_ADMIN_PASSWORD"
+          require_value JWT_SIGNING_KEY "$JWT_SIGNING_KEY"
+          require_value ALERT_EMAIL "$ALERT_EMAIL"
+          echo "GitHub Dev configuration is present."
+
+      - name: Verify GitHub OIDC subject before Azure login
+        shell: bash
+        env:
+          EXPECTED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT }}
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange")
+          TOKEN=$(python -c 'import json,sys; print(json.load(sys.stdin)["value"])' <<< "$RESPONSE")
+          TOKEN="$TOKEN" EXPECTED_SUBJECT="$EXPECTED_SUBJECT" python - <<'PY'
+          import base64, json, os, sys
+          token = os.environ['TOKEN']
+          payload = token.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          subject = claims.get('sub', '')
+          print('OIDC issuer:', claims.get('iss'))
+          print('OIDC audience:', claims.get('aud'))
+          print('OIDC subject:', subject)
+          print('OIDC repository_id:', claims.get('repository_id'))
+          print('OIDC repository_owner_id:', claims.get('repository_owner_id'))
+          if subject != os.environ['EXPECTED_SUBJECT']:
+              print('OIDC subject does not match AZURE_FEDERATED_SUBJECT.', file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Azure login with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: infra/environments/dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..8}; do
+            if terraform init \
+              -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+              -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+              -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+              -backend-config="key=${{ vars.TFSTATE_KEY }}" \
+              -backend-config="use_oidc=true" \
+              -backend-config="use_azuread_auth=true"; then
+              exit 0
+            fi
+            echo "Terraform backend not ready yet; retry $i/8"
+            sleep 15
+          done
+          exit 1
+
+      - name: Terraform validate
+        working-directory: infra/environments/dev
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: infra/environments/dev
+        env:
+          TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: infra/environments/dev
+        env:
+          TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Read infrastructure outputs
+        if: ${{ inputs.action == 'apply' }}
+        id: tf
+        working-directory: infra/environments/dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "key_vault=$(terraform output -raw key_vault_name)" >> "$GITHUB_OUTPUT"
+          echo "sql_fqdn=$(terraform output -raw sql_server_fqdn)" >> "$GITHUB_OUTPUT"
+          echo "sql_database=$(terraform output -raw sql_database_name)" >> "$GITHUB_OUTPUT"
+          echo "sql_admin_login=$(terraform output -raw sql_admin_login)" >> "$GITHUB_OUTPUT"
+
+      - name: Inject Dev runtime secrets into Key Vault
+        if: ${{ inputs.action == 'apply' }}
+        shell: bash
+        env:
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          CONNECTION_STRING="Server=tcp:${{ steps.tf.outputs.sql_fqdn }},1433;Initial Catalog=${{ steps.tf.outputs.sql_database }};Persist Security Info=False;User ID=${{ steps.tf.outputs.sql_admin_login }};Password=${SQL_ADMIN_PASSWORD};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+          set_secret() {
+            local name="$1"
+            local value="$2"
+            for i in {1..18}; do
+              if az keyvault secret set --vault-name "${{ steps.tf.outputs.key_vault }}" --name "$name" --value "$value" --output none; then
+                return 0
+              fi
+              echo "Key Vault RBAC not ready for $name; retry $i/18"
+              sleep 10
+            done
+            return 1
+          }
+          set_secret sql-connection-string "$CONNECTION_STRING"
+          set_secret jwt-signing-key "$JWT_SIGNING_KEY"
+
+      - name: Terraform summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### FoodCousins Terraform Dev" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source branch: ${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Requested action: ${{ inputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Environment: dev" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Function memory baseline: 2048 MB" >> "$GITHUB_STEP_SUMMARY"
