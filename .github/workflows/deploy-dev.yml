@@ -21,15 +21,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enforce dev-deploy source branch
+      - name: Enforce main source branch
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_NAME}" != "dev-deploy" ]; then
-            echo "Deploy Dev must be manually run from branch 'dev-deploy'."
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Deploy Dev must be manually run from branch 'main'."
             echo "Selected branch: ${GITHUB_REF_NAME}"
             exit 1
-          fi
+      fi
+
+    echo "Running Dev deployment from main."
 
       - name: Verify GitHub OIDC subject before Azure login
         shell: bash
