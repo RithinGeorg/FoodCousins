@@ -29,9 +29,9 @@ jobs:
             echo "Deploy Dev must be manually run from branch 'main'."
             echo "Selected branch: ${GITHUB_REF_NAME}"
             exit 1
-      fi
+          fi
 
-    echo "Running Dev deployment from main."
+          echo "Running Dev deployment from main."
 
       - name: Verify GitHub OIDC subject before Azure login
         shell: bash
