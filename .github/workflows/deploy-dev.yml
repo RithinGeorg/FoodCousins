@@ -116,11 +116,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for i in {1..24}; do
-            if curl --fail --silent --show-error "${{ steps.azure.outputs.api_url }}/health"; then exit 0; fi
-            echo "API not healthy yet; retry $i/24"
+
+          HEALTH_URL="${{ steps.azure.outputs.api_url }}/health"
+
+          echo "Checking API health at: $HEALTH_URL"
+
+          for i in {1..30}; do
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$HEALTH_URL"; then
+
+              echo
+              echo "API is healthy."
+              exit 0
+            fi
+
+            echo "API not healthy yet; retry $i/30"
             sleep 10
           done
+
+          echo "API health check failed after deployment." >&2
           exit 1
 
       - name: Deploy Functions
