@@ -62,7 +62,7 @@ jobs:
           TFSTATE_KEY: ${{ vars.TFSTATE_KEY }}
           SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
           JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
-          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
         run: |
           set -euo pipefail
           require_value() { [ -n "$2" ] || { echo "$1 is missing from GitHub environment dev."; exit 1; }; }
@@ -148,7 +148,7 @@ jobs:
         working-directory: infra/environments/dev
         env:
           TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
-          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
         run: terraform plan -input=false -out=tfplan
 
       - name: Terraform apply
@@ -156,7 +156,7 @@ jobs:
         working-directory: infra/environments/dev
         env:
           TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
-          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
         run: terraform apply -input=false -auto-approve tfplan
 
       - name: Read infrastructure outputs
