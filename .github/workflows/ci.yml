@@ -4,15 +4,11 @@ on:
   push:
     branches:
       - main
-      - develop
-      - terraform-dev
-      - dev-deploy
+
   pull_request:
     branches:
       - main
-      - develop
-      - terraform-dev
-      - dev-deploy
+
   workflow_dispatch:
 
 jobs:
