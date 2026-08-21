@@ -45,9 +45,9 @@ jobs:
           echo "Terraform Dev must be manually run from branch 'main'."
           echo "Selected branch: ${GITHUB_REF_NAME}"
           exit 1
-    fi
+        fi
 
-    echo "Running Terraform Dev from main."
+        echo "Running Terraform Dev from main."
 
       - name: Validate GitHub Dev configuration
         shell: bash
