@@ -40,12 +40,12 @@ jobs:
       - name: Enforce main source branch
         shell: bash
         run: |
-        set -euo pipefail
-        if [ "${GITHUB_REF_NAME}" != "main" ]; then
-          echo "Terraform Dev must be manually run from branch 'main'."
-          echo "Selected branch: ${GITHUB_REF_NAME}"
-          exit 1
-        fi
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Terraform Dev must be manually run from branch 'main'."
+            echo "Selected branch: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
 
         echo "Running Terraform Dev from main."
 
