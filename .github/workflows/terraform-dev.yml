@@ -47,7 +47,7 @@ jobs:
             exit 1
           fi
 
-        echo "Running Terraform Dev from main."
+          echo "Running Terraform Dev from main."
 
       - name: Validate GitHub Dev configuration
         shell: bash
