@@ -4,11 +4,11 @@ public enum CookAtHomeOrderStatus
 {
     Requested,
     Processing,
-    PriceCalculated,
     Confirmed,
-    AcceptedByCook,
     Preparing,
-    Completed,
+    ReadyForDelivery,
+    OutForDelivery,
+    Delivered,
     Cancelled,
-    Rejected
+    Failed
 }

@@ -113,6 +113,10 @@ try
         await using var scope = app.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<FoodCousinsDbContext>();
         await db.Database.EnsureCreatedAsync();
+        await DbInitializer.SeedAsync(
+            db,
+            builder.Configuration,
+            scope.ServiceProvider.GetService<ILoggerFactory>()?.CreateLogger("DbInitializer"));
     }
 
     Log.Information("FoodCousins API starting in {Environment}", app.Environment.EnvironmentName);

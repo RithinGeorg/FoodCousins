@@ -5,30 +5,50 @@ namespace FoodCousins.Application.CookAtHome;
 public sealed record CreateCookAtHomeOrderRequest(
     Guid FoodId,
     int PeopleCount,
-    string Location,
-    DateTimeOffset RequestedForUtc,
+    string Postcode,
+    string DeliveryAddress,
+    DateTimeOffset RequestedDeliveryUtc,
     string ContactName,
     string ContactPhone,
     string? SpecialInstructions);
 
+public sealed record CookAtHomeOrderIngredientDto(
+    string IngredientName,
+    decimal Quantity,
+    string Unit,
+    bool IsOptional,
+    string? Notes);
+
+public sealed record CookAtHomeOrderStatusHistoryDto(
+    CookAtHomeOrderStatus Status,
+    string? Note,
+    DateTimeOffset CreatedAtUtc);
+
 public sealed record CookAtHomeOrderDto(
     Guid Id,
     string OrderNumber,
-    Guid CustomerId,
-    Guid CookProfileId,
-    string CookName,
     Guid FoodId,
     string FoodName,
     int PeopleCount,
-    string Location,
-    DateTimeOffset RequestedForUtc,
+    string Postcode,
+    string Suburb,
+    string DeliveryAddress,
+    DateTimeOffset RequestedDeliveryUtc,
+    DateTimeOffset? EstimatedDeliveryUtc,
     string ContactName,
     string ContactPhone,
     string? SpecialInstructions,
     CookAtHomeOrderStatus Status,
-    decimal? EstimatedPrice,
+    decimal Subtotal,
+    decimal DeliveryFee,
+    decimal TotalAmount,
+    string RecipeTitle,
+    string RecipeInstructions,
+    DateTimeOffset? EmailSentAtUtc,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset UpdatedAtUtc);
+    DateTimeOffset UpdatedAtUtc,
+    IReadOnlyList<CookAtHomeOrderIngredientDto> Ingredients,
+    IReadOnlyList<CookAtHomeOrderStatusHistoryDto> StatusHistory);
 
-public sealed record UpdateCookAtHomeStatusRequest(CookAtHomeOrderStatus Status);
 public sealed record CookAtHomeOrderRequestedEvent(Guid OrderId);
+public sealed record IngredientKitOrderConfirmedEvent(Guid OrderId);

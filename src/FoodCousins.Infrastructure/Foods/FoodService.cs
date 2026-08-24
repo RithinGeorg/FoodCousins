@@ -1,74 +1,426 @@
 using FoodCousins.Application.Foods;
-using FoodCousins.Application.Storage;
 using FoodCousins.Domain.Entities;
 using FoodCousins.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 namespace FoodCousins.Infrastructure.Foods;
-internal sealed class FoodService(FoodCousinsDbContext db, IImageStorage images) : IFoodService
-{
-    public async Task<IReadOnlyList<FoodDto>> GetAvailableAsync(CancellationToken ct) => await SearchAsync(null, null, ct);
 
-    public async Task<IReadOnlyList<FoodDto>> SearchAsync(string? query, string? cuisine, CancellationToken ct)
+internal sealed class FoodService(
+    FoodCousinsDbContext db,
+    IFoodDiscoveryProvider discoveryProvider,
+    ILogger<FoodService> logger) : IFoodService
+{
+    public async Task<IReadOnlyList<FoodSummaryDto>> GetPublishedAsync(CancellationToken ct)
     {
-        var q = db.Foods.AsNoTracking().Where(x => x.IsAvailable && x.CookProfile.IsActive);
-        if (!string.IsNullOrWhiteSpace(query))
+        var foods = await db.Foods.AsNoTracking()
+            .Where(x => x.IsPublished)
+            .OrderBy(x => x.Name)
+            .Take(100)
+            .ToListAsync(ct);
+
+        return foods.Select(MapSummary).ToList();
+    }
+
+    public async Task<FoodSearchResultDto> SearchAsync(string query, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("Food search query is required.");
+        var trimmedQuery = query.Trim();
+        var normalized = NormalizeFoodName(trimmedQuery);
+        if (normalized.Length < 2) throw new ArgumentException("Enter at least two characters to search for a food.");
+
+        var existing = await db.Foods.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.NormalizedName == normalized, ct);
+
+        if (existing is not null)
         {
-            var value = query.Trim();
-            q = q.Where(x => x.Name.Contains(value) || (x.Description != null && x.Description.Contains(value)) || (x.Tags != null && x.Tags.Contains(value)));
+            if (!existing.IsPublished) throw new KeyNotFoundException("This food is not currently published.");
+
+            logger.LogInformation("Food search served from database. Query={Query}, FoodId={FoodId}.", query, existing.Id);
+            return new FoodSearchResultDto(
+                trimmedQuery,
+                "Database",
+                MapSummary(existing),
+                await GetCousinsAsync(existing.Id, ct));
         }
-        if (!string.IsNullOrWhiteSpace(cuisine)) { var c = cuisine.Trim(); q = q.Where(x => x.Cuisine == c); }
-        return await q.OrderBy(x => x.Name).Take(100).Select(Map()).ToListAsync(ct);
+
+        // A previous AI request may have resolved a non-canonical phrase (for example
+        // "chicken butter") to a canonical food name ("Butter Chicken"). Reuse that
+        // resolution before spending on another external call.
+        var priorFoodId = await db.AiFoodRequests.AsNoTracking()
+            .Where(x => x.Succeeded && x.FoodId != null && x.Query == trimmedQuery)
+            .OrderByDescending(x => x.CompletedAtUtc)
+            .Select(x => x.FoodId)
+            .FirstOrDefaultAsync(ct);
+
+        if (priorFoodId is Guid cachedFoodId)
+        {
+            // Resolve the cached food regardless of publication state. If an admin has hidden
+            // the food, do not spend money calling AI again for the same phrase.
+            var cached = await db.Foods.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.Id == cachedFoodId, ct);
+
+            if (cached is not null)
+            {
+                if (!cached.IsPublished)
+                    throw new KeyNotFoundException("This food is not currently published.");
+
+                logger.LogInformation("Food search served from previous AI query cache. Query={Query}, FoodId={FoodId}.", query, cached.Id);
+                return new FoodSearchResultDto(
+                    trimmedQuery,
+                    "Database",
+                    MapSummary(cached),
+                    await GetCousinsAsync(cached.Id, ct));
+            }
+        }
+
+        var audit = new AiFoodRequest
+        {
+            Query = trimmedQuery,
+            Provider = discoveryProvider.ProviderName,
+            Model = discoveryProvider.ModelName
+        };
+        db.AiFoodRequests.Add(audit);
+        await db.SaveChangesAsync(ct);
+
+        AiFoodDiscoveryContract discovered;
+        try
+        {
+            discovered = await discoveryProvider.DiscoverAsync(trimmedQuery, ct);
+        }
+        catch (Exception ex)
+        {
+            audit.Succeeded = false;
+            audit.CompletedAtUtc = DateTimeOffset.UtcNow;
+            audit.FailureMessage = ex.Message[..Math.Min(ex.Message.Length, 2000)];
+            await db.SaveChangesAsync(ct);
+            throw;
+        }
+
+        try
+        {
+            await using (var transaction =
+                await db.Database.BeginTransactionAsync(ct))
+            {
+                try
+                {
+                    var primary =
+                        await GetOrCreateFoodAsync(discovered.Food, ct);
+
+                    var relatedFoodIds = new HashSet<Guid>();
+
+                    foreach (var cousinContract in discovered.Cousins)
+                    {
+                        var cousin =
+                            await GetOrCreateFoodAsync(
+                                cousinContract.Food,
+                                ct);
+
+                        if (cousin.Id == primary.Id ||
+                            !relatedFoodIds.Add(cousin.Id))
+                        {
+                            continue;
+                        }
+
+                        var existingSimilarity =
+                            await db.FoodSimilarities
+                                .SingleOrDefaultAsync(
+                                    x =>
+                                        x.SourceFoodId == primary.Id &&
+                                        x.RelatedFoodId == cousin.Id,
+                                    ct);
+
+                        if (existingSimilarity is null)
+                        {
+                            db.FoodSimilarities.Add(
+                                MapSimilarity(
+                                    primary.Id,
+                                    cousin.Id,
+                                    cousinContract.Similarity));
+                        }
+
+                        var existingReverse =
+                            await db.FoodSimilarities
+                                .SingleOrDefaultAsync(
+                                    x =>
+                                        x.SourceFoodId == cousin.Id &&
+                                        x.RelatedFoodId == primary.Id,
+                                    ct);
+
+                        if (existingReverse is null)
+                        {
+                            db.FoodSimilarities.Add(
+                                MapSimilarity(
+                                    cousin.Id,
+                                    primary.Id,
+                                    cousinContract.Similarity));
+                        }
+                    }
+
+                    audit.Succeeded = true;
+                    audit.FoodId = primary.Id;
+                    audit.CompletedAtUtc = DateTimeOffset.UtcNow;
+                    audit.FailureMessage = null;
+
+                    await db.SaveChangesAsync(ct);
+                    await transaction.CommitAsync(ct);
+
+                    logger.LogInformation(
+                        "Food discovery saved AI result to database. " +
+                        "Query={Query}, FoodId={FoodId}, CousinCount={CousinCount}.",
+                        query,
+                        primary.Id,
+                        discovered.Cousins.Count);
+
+                    return new FoodSearchResultDto(
+                        trimmedQuery,
+                        "AI",
+                        MapSummary(primary),
+                        await GetCousinsAsync(primary.Id, ct));
+                }
+                catch
+                {
+                    await transaction.RollbackAsync(ct);
+                    throw;
+                }
+            }
+        }
+        catch (DbUpdateException ex)
+        {
+            // At this point the failed transaction has already been
+            // rolled back AND disposed.
+            db.ChangeTracker.Clear();
+
+            // Did another request create the same canonical food first?
+            var winner = await db.Foods
+                .AsNoTracking()
+                .SingleOrDefaultAsync(
+                    x => x.NormalizedName == normalized,
+                    ct);
+
+            // No winner means this DbUpdateException was caused by
+            // something else. Preserve the original database error.
+            if (winner is null)
+            {
+                throw;
+            }
+
+            logger.LogWarning(
+                ex,
+                "Concurrent food discovery detected. Another request " +
+                "created the food first. Query={Query}, FoodId={FoodId}.",
+                query,
+                winner.Id);
+
+            // Our AI request itself succeeded, so complete its audit record.
+            var persistedAudit = await db.AiFoodRequests
+                .SingleAsync(
+                    x => x.Id == audit.Id,
+                    ct);
+
+            persistedAudit.Succeeded = true;
+            persistedAudit.FoodId = winner.Id;
+            persistedAudit.CompletedAtUtc = DateTimeOffset.UtcNow;
+            persistedAudit.FailureMessage = null;
+
+            await db.SaveChangesAsync(ct);
+
+            return new FoodSearchResultDto(
+                trimmedQuery,
+                "Database",
+                MapSummary(winner),
+                await GetCousinsAsync(winner.Id, ct));
+        }
+    }
+
+    public async Task<FoodDetailDto?> GetByIdAsync(Guid id, CancellationToken ct)
+    {
+        var food = await db.Foods.AsNoTracking()
+            .Include(x => x.Recipe).ThenInclude(x => x!.Steps)
+            .Include(x => x.Ingredients).ThenInclude(x => x.Ingredient)
+            .SingleOrDefaultAsync(x => x.Id == id && x.IsPublished, ct);
+
+        if (food is null) return null;
+        if (food.Recipe is null) throw new InvalidOperationException("Food recipe is missing.");
+
+        return new FoodDetailDto(
+            MapSummary(food),
+            new RecipeDto(
+                food.Recipe.Title,
+                food.Recipe.PrepMinutes,
+                food.Recipe.CookMinutes,
+                food.Recipe.Servings,
+                food.Recipe.Steps.OrderBy(x => x.StepNumber)
+                    .Select(x => new RecipeStepDto(x.StepNumber, x.Instruction)).ToList()),
+            food.Ingredients.OrderBy(x => x.Ingredient.Name)
+                .Select(x => new FoodIngredientDto(
+                    x.Ingredient.Name,
+                    x.QuantityPerServing,
+                    x.Unit,
+                    x.IsOptional,
+                    x.Notes))
+                .ToList(),
+            await GetCousinsAsync(food.Id, ct));
     }
 
     public async Task<IReadOnlyList<FoodCousinDto>> GetCousinsAsync(Guid id, CancellationToken ct)
     {
-        var source = await db.Foods.AsNoTracking().Include(x => x.CookProfile).SingleOrDefaultAsync(x => x.Id == id && x.IsAvailable, ct)
-            ?? throw new KeyNotFoundException("Food not found.");
-        var candidates = await db.Foods.AsNoTracking().Where(x => x.Id != id && x.IsAvailable && x.CookProfile.IsActive).Select(Map()).ToListAsync(ct);
-        var sourceTags = Tokens(source.Tags, source.Name, source.Description);
-        return candidates.Select(food =>
-        {
-            var tags = Tokens(food.Tags, food.Name, food.Description);
-            var intersection = sourceTags.Intersect(tags).Count();
-            var union = Math.Max(1, sourceTags.Union(tags).Count());
-            var tagScore = (double)intersection / union;
-            var sameCuisine = string.Equals(source.Cuisine, food.Cuisine, StringComparison.OrdinalIgnoreCase);
-            var score = Math.Min(0.99, 0.35 + tagScore * 0.5 + (sameCuisine ? 0.14 : 0));
-            var why = intersection > 0 ? $"Shares {intersection} flavour/food tag{(intersection == 1 ? "" : "s")}{(sameCuisine ? " and the same cuisine" : " across cuisines")}." : sameCuisine ? "A different dish from the same cuisine." : "A cross-culture cousin to explore.";
-            return new FoodCousinDto(food, Math.Round(score, 2), why);
-        }).OrderByDescending(x => x.Score).ThenBy(x => x.Food.Name).Take(8).ToList();
+        var rows = await db.FoodSimilarities.AsNoTracking()
+            .Include(x => x.RelatedFood)
+            .Where(x => x.SourceFoodId == id && x.RelatedFood.IsPublished)
+            .OrderByDescending(x => x.OverallScore)
+            .Take(12)
+            .ToListAsync(ct);
+
+        return rows.Select(x => new FoodCousinDto(
+            MapSummary(x.RelatedFood),
+            new SimilarityBreakdownDto(
+                x.OverallScore,
+                x.TasteScore,
+                x.TextureScore,
+                x.IngredientScore,
+                x.CookingMethodScore,
+                x.DishTypeScore,
+                x.CuisineScore,
+                x.DietaryScore,
+                x.WhySimilar)))
+            .ToList();
     }
 
-    public Task<FoodDto?> GetByIdAsync(Guid id,CancellationToken ct)=>db.Foods.AsNoTracking().Where(x=>x.Id==id).Select(Map()).SingleOrDefaultAsync(ct);
-    public async Task<IReadOnlyList<FoodDto>> GetCookFoodsAsync(Guid userId,CancellationToken ct)=>await db.Foods.AsNoTracking().Where(x=>x.CookProfile.UserId==userId).OrderByDescending(x=>x.CreatedAtUtc).Select(Map()).ToListAsync(ct);
-    public async Task<FoodDto> CreateAsync(Guid userId,UpsertFoodRequest r,CancellationToken ct)
+    private async Task<Food> GetOrCreateFoodAsync(AiFoodContract contract, CancellationToken ct)
     {
-        Validate(r); var cook=await db.CookProfiles.SingleOrDefaultAsync(x=>x.UserId==userId,ct)??throw new UnauthorizedAccessException("Cook profile not found.");
-        var f=new Food{CookProfileId=cook.Id,Name=r.Name.Trim(),Description=r.Description?.Trim(),Cuisine=r.Cuisine.Trim(),Tags=NormalizeTags(r.Tags),Price=r.Price,IsAvailable=r.IsAvailable};
-        db.Foods.Add(f); await db.SaveChangesAsync(ct); return (await GetByIdAsync(f.Id,ct))!;
+        var normalized = NormalizeFoodName(contract.Name);
+
+        var existing = await db.Foods
+            .Include(x => x.Recipe).ThenInclude(x => x!.Steps)
+            .Include(x => x.Ingredients).ThenInclude(x => x.Ingredient)
+            .SingleOrDefaultAsync(x => x.NormalizedName == normalized, ct);
+
+        if (existing is not null) return existing;
+
+        var food = new Food
+        {
+            Name = Clean(contract.Name, 160),
+            NormalizedName = normalized,
+            Description = CleanNullable(contract.Description, 2500),
+            Cuisine = Clean(contract.Cuisine, 100),
+            CountryOrRegion = CleanNullable(contract.CountryOrRegion, 120),
+            Tags = CleanNullable(contract.Tags, 1000),
+            KitPricePerPerson = 0m,
+            IsCookAtHomeEnabled = false,
+            IsPublished = true,
+            AiGenerated = true,
+            AiReviewed = false
+        };
+
+        food.Recipe = new Recipe
+        {
+            FoodId = food.Id,
+            Title = Clean(contract.Recipe.Title, 200),
+            PrepMinutes = Math.Clamp(contract.Recipe.PrepMinutes, 0, 1440),
+            CookMinutes = Math.Clamp(contract.Recipe.CookMinutes, 0, 1440),
+            Servings = Math.Clamp(contract.Recipe.Servings, 1, 100),
+            Steps = contract.Recipe.Steps
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Take(30)
+                .Select((x, index) => new RecipeStep
+                {
+                    StepNumber = index + 1,
+                    Instruction = Clean(x, 3000)
+                })
+                .ToList()
+        };
+
+        foreach (var ingredientContract in contract.Ingredients.Take(100))
+        {
+            if (string.IsNullOrWhiteSpace(ingredientContract.Name)) continue;
+
+            var ingredientName = Clean(ingredientContract.Name, 160);
+            var ingredientNormalized = NormalizeIngredientName(ingredientName);
+
+            var ingredient = db.Ingredients.Local.FirstOrDefault(x => x.NormalizedName == ingredientNormalized)
+                ?? await db.Ingredients.SingleOrDefaultAsync(x => x.NormalizedName == ingredientNormalized, ct);
+
+            if (ingredient is null)
+            {
+                ingredient = new Ingredient
+                {
+                    Name = ingredientName,
+                    NormalizedName = ingredientNormalized
+                };
+                db.Ingredients.Add(ingredient);
+            }
+
+            food.Ingredients.Add(new FoodIngredient
+            {
+                FoodId = food.Id,
+                Ingredient = ingredient,
+                IngredientId = ingredient.Id,
+                QuantityPerServing = Math.Max(0m, ingredientContract.QuantityPerServing),
+                Unit = Clean(ingredientContract.Unit, 40),
+                IsOptional = ingredientContract.IsOptional,
+                Notes = CleanNullable(ingredientContract.Notes, 500)
+            });
+        }
+
+        db.Foods.Add(food);
+        await db.SaveChangesAsync(ct);
+        return food;
     }
-    public async Task<FoodDto> UpdateAsync(Guid userId,Guid id,UpsertFoodRequest r,CancellationToken ct)
+
+    private static FoodSimilarity MapSimilarity(Guid sourceFoodId, Guid relatedFoodId, AiSimilarityContract x) => new()
     {
-        Validate(r); var f=await db.Foods.Include(x=>x.CookProfile).SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new KeyNotFoundException("Food not found.");
-        if(f.CookProfile.UserId!=userId) throw new UnauthorizedAccessException("You do not own this food.");
-        f.Name=r.Name.Trim();f.Description=r.Description?.Trim();f.Cuisine=r.Cuisine.Trim();f.Tags=NormalizeTags(r.Tags);f.Price=r.Price;f.IsAvailable=r.IsAvailable;
-        await db.SaveChangesAsync(ct); return (await GetByIdAsync(f.Id,ct))!;
-    }
-    public async Task<FoodDto> SetImageAsync(Guid userId,Guid id,Stream content,string contentType,string fileName,CancellationToken ct)
+        SourceFoodId = sourceFoodId,
+        RelatedFoodId = relatedFoodId,
+        OverallScore = ClampScore(x.Overall),
+        TasteScore = ClampScore(x.Taste),
+        TextureScore = ClampScore(x.Texture),
+        IngredientScore = ClampScore(x.Ingredients),
+        CookingMethodScore = ClampScore(x.CookingMethod),
+        DishTypeScore = ClampScore(x.DishType),
+        CuisineScore = ClampScore(x.Cuisine),
+        DietaryScore = ClampScore(x.Dietary),
+        WhySimilar = Clean(x.WhySimilar, 1500)
+    };
+
+    internal static FoodSummaryDto MapSummary(Food food) => new(
+        food.Id,
+        food.Name,
+        food.Description,
+        food.Cuisine,
+        food.CountryOrRegion,
+        food.Tags,
+        food.KitPricePerPerson,
+        food.IsPublished,
+        food.IsCookAtHomeEnabled,
+        food.ImageUrl,
+        food.AiGenerated,
+        food.AiReviewed);
+
+    internal static string NormalizeFoodName(string value) => Normalize(value, 160);
+    private static string NormalizeIngredientName(string value) => Normalize(value, 160);
+
+    private static string Normalize(string value, int maxLength)
     {
-        var f=await db.Foods.Include(x=>x.CookProfile).SingleOrDefaultAsync(x=>x.Id==id,ct)??throw new KeyNotFoundException("Food not found.");
-        if(f.CookProfile.UserId!=userId) throw new UnauthorizedAccessException("You do not own this food.");
-        f.ImageUrl=await images.UploadFoodImageAsync(id,content,contentType,fileName,ct); await db.SaveChangesAsync(ct); return (await GetByIdAsync(id,ct))!;
+        if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("Value is required.");
+        var cleaned = string.Join(' ', value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+        if (cleaned.Length > maxLength) cleaned = cleaned[..maxLength];
+        return cleaned.ToUpperInvariant();
     }
-    private static void Validate(UpsertFoodRequest r)
+
+    private static string Clean(string value, int maxLength)
     {
-        if (string.IsNullOrWhiteSpace(r.Name) || r.Name.Trim().Length > 160) throw new ArgumentException("Food name is required and must be 160 characters or fewer.");
-        if (string.IsNullOrWhiteSpace(r.Cuisine) || r.Cuisine.Trim().Length > 80) throw new ArgumentException("Cuisine is required and must be 80 characters or fewer.");
-        if (r.Description?.Trim().Length > 2000) throw new ArgumentException("Description must be 2000 characters or fewer.");
-        if (r.Price <= 0 || r.Price > 100_000) throw new ArgumentException("Price must be greater than zero and no more than 100000.");
+        if (string.IsNullOrWhiteSpace(value)) throw new InvalidOperationException("AI food data contains an empty required value.");
+        var cleaned = value.Trim();
+        return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength];
     }
-    private static string? NormalizeTags(string? tags) => string.IsNullOrWhiteSpace(tags) ? null : string.Join(',', tags.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(x => x.ToLowerInvariant()).Distinct().Take(20));
-    private static HashSet<string> Tokens(params string?[] values) => values.Where(x => !string.IsNullOrWhiteSpace(x)).SelectMany(x => x!.ToLowerInvariant().Split(new[]{' ', ',', '-', '/', '.'}, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).Where(x => x.Length > 2).ToHashSet();
-    private static System.Linq.Expressions.Expression<Func<Food,FoodDto>> Map()=>x=>new FoodDto(x.Id,x.CookProfileId,x.CookProfile.BusinessName,x.Name,x.Description,x.Cuisine,x.Tags,x.Price,x.IsAvailable,x.ImageUrl);
+
+    private static string? CleanNullable(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var cleaned = value.Trim();
+        return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength];
+    }
+
+    private static decimal ClampScore(decimal score) => Math.Clamp(score, 0m, 100m);
 }
