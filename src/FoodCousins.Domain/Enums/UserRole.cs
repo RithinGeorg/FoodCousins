@@ -1,2 +1,7 @@
 namespace FoodCousins.Domain.Enums;
-public enum UserRole { Customer, Cook, Admin }
+
+public enum UserRole
+{
+    Customer,
+    Admin
+}
