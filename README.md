@@ -308,4 +308,3 @@ Not included yet:
 - AKS/microservices
 - Production infrastructure
 
-These are deliberately deferred until the Dev MVP and first-customer workflow are stable.
